@@ -254,7 +254,89 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def readBlenderCameras(cam_extrinsics_path, cam_intrinsics_path, white_background, images_folder):
+    cam_infos = []
+
+    cam_extrinsics = np.load(cam_extrinsics_path)
+    cam_intrinsics = {}
+
+    with open(cam_intrinsics_path, 'r') as file:
+        for line in file:
+            line = line.strip()
+            elems = line.split()
+            cam_intrinsics[elems[0]] = float(elems[1])
+    
+    width = cam_intrinsics['Width']
+    height = cam_intrinsics['Height']
+    FovX = cam_intrinsics['FovX']
+    FovY = focal2fov(fov2focal(FovX, width), height)
+    image_file_list = os.listdir(images_folder)
+    image_file_list = sorted(image_file_list, key=lambda x: int(os.path.splitext(x)[0]))
+
+    for idx in range(cam_extrinsics.shape[0]):
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, cam_extrinsics.shape[0]))
+        sys.stdout.flush()
+
+        extr = cam_extrinsics[idx]
+
+        c2w = extr
+        # change from Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+        c2w[:3, 1:3] *= -1
+
+        # get the world-to-camera transform and set R, T
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
+        T = w2c[:3, 3]
+
+        image_path = os.path.join(images_folder, image_file_list[idx])
+        image_name = os.path.basename(image_path).split(".")[0]
+        image = Image.open(image_path)
+
+        im_data = np.array(image.convert("RGBA"))
+
+        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+
+        norm_data = im_data / 255.0
+        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+        image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+        cam_info = CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_infos.append(cam_info)
+    sys.stdout.write('\n')
+    return cam_infos
+
+def readShapeNetObjectInfo(path, white_background, eval, llffhold=8):
+    cam_extrinsics_path = os.path.join(path, "cameras", "extrinsics.npy")
+    cam_intrinsics_path = os.path.join(path, "cameras", "intrinsics.txt")
+    images_folder = os.path.join(path, "images")
+    cam_infos = readBlenderCameras(cam_extrinsics_path, cam_intrinsics_path, white_background, images_folder)
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+    
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "pointcloud.ply")
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Object": readShapeNetObjectInfo
 }
